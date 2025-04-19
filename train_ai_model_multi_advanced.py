@@ -1,8 +1,4 @@
 import os
-os.environ['OMP_NUM_THREADS'] = '12'
-os.environ['MKL_NUM_THREADS'] = '12'
-os.environ['OPENBLAS_NUM_THREADS'] = '12'
-
 import pandas as pd
 import numpy as np
 from catboost import CatBoostClassifier
@@ -11,6 +7,7 @@ from xgboost import XGBClassifier
 from sklearn.model_selection import train_test_split, GridSearchCV
 from sklearn.metrics import classification_report, accuracy_score, confusion_matrix
 from sklearn.ensemble import VotingClassifier
+from sklearn.feature_selection import RFE
 import joblib
 import logging
 import seaborn as sns
@@ -21,29 +18,23 @@ from data.data_manager import get_candle_data
 from feature_engineering_full_ultra_v2 import extract_features_full
 from config import SYMBOLS
 
-# تنظیم لاگ‌گیری برای ذخیره در فایل و نمایش در کنسول
 os.makedirs('notebooks', exist_ok=True)
 
-# تنظیم فرمت لاگ
 log_format = '%(asctime)s - %(levelname)s - %(message)s'
 formatter = logging.Formatter(log_format)
 
-# تنظیم FileHandler برای ذخیره لاگ‌ها در فایل با کدگذاری UTF-8
 file_handler = logging.FileHandler('notebooks/training_log.txt', encoding='utf-8')
 file_handler.setFormatter(formatter)
 
-# تنظیم StreamHandler برای نمایش لاگ‌ها در کنسول
 console_handler = logging.StreamHandler()
 console_handler.setFormatter(formatter)
 
-# تنظیم logger
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
-logger.handlers = []  # حذف handlerهای پیش‌فرض
+logger.handlers = []
 logger.addHandler(file_handler)
 logger.addHandler(console_handler)
 
-# 🎯 تنظیمات
 TIMEFRAME = '4h'
 WINDOW_SIZE = 100
 LABEL_LOOKAHEAD = 12
@@ -52,8 +43,8 @@ def label_data(df: pd.DataFrame) -> pd.DataFrame:
     logging.info("شروع لیبل‌گذاری داده‌ها...")
     df['future_return'] = df['close'].shift(-LABEL_LOOKAHEAD) / df['close'] - 1
     df['label'] = 'Hold'
-    df.loc[df['future_return'] > 0.005, 'label'] = 'Buy'
-    df.loc[df['future_return'] < -0.005, 'label'] = 'Sell'
+    df.loc[df['future_return'] > 0.002, 'label'] = 'Buy'  # کاهش آستانه به 0.002
+    df.loc[df['future_return'] < -0.002, 'label'] = 'Sell'
     logging.info("لیبل‌گذاری داده‌ها انجام شد.")
     return df.dropna()
 
@@ -86,17 +77,17 @@ def ensure_dtypes(df: pd.DataFrame) -> pd.DataFrame:
     logging.info("نوع داده‌ها اصلاح شد.")
     return df
 
-def plot_confusion_matrix(y_true, y_pred):
-    logging.info("رسم ماتریس درهم‌ریختگی...")
+def plot_confusion_matrix(y_true, y_pred, model_name):
+    logging.info(f"رسم ماتریس درهم‌ریختگی برای {model_name}...")
     cm = confusion_matrix(y_true, y_pred)
     plt.figure(figsize=(8, 6))
     sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
-    plt.title('Confusion Matrix')
+    plt.title(f'Confusion Matrix - {model_name}')
     plt.ylabel('True Label')
     plt.xlabel('Predicted Label')
-    plt.savefig('notebooks/confusion_matrix.png')
+    plt.savefig(f'notebooks/confusion_matrix_{model_name}.png')
     plt.close()
-    logging.info("ماتریس درهم‌ریختگی ذخیره شد: notebooks/confusion_matrix.png")
+    logging.info(f"ماتریس درهم‌ریختگی ذخیره شد: notebooks/confusion_matrix_{model_name}.png")
 
 def main():
     logging.info("شروع آموزش مدل...")
@@ -135,16 +126,8 @@ def main():
     df_final = pd.concat(all_data)
     df_final.dropna(inplace=True)
     logging.info(f"داده‌های نهایی ساخته شدند: {df_final.shape}")
-    
-    if 'news_sentiment' not in df_final.columns:
-        df_final['news_sentiment'] = 0.0
 
-    total = len(df_final)
-    non_null = df_final['news_sentiment'].notna().sum()
-    percentage = (non_null / total) * 100
-    logging.info(f"درصد داده‌هایی که news_sentiment دارند: {percentage:.2f}%  ({non_null}/{total})")
-
-    fundamental_features = ['news_sentiment', 'fundamental_score', 'volume_score', 'news_score']
+    fundamental_features = [f"news_emb_{i}" for i in range(768)] + ['volume_score']
     technical_features = [col for col in df_final.columns if col not in fundamental_features + ['label', 'future_return', 'symbol']]
 
     df_final = replace_outliers(df_final, technical_features + fundamental_features)
@@ -152,14 +135,9 @@ def main():
     X = df_final.drop(columns=['label', 'future_return', 'symbol'])
     y = df_final['label']
 
-    df_fundamental = df_final[df_final['news_sentiment'] != 0]
-    X_fundamental = df_fundamental[fundamental_features]
-    y_fundamental = df_fundamental['label']
-
     logging.info(f"ویژگی‌های تکنیکال: {technical_features}")
     logging.info(f"ویژگی‌های فاندامنتال: {fundamental_features}")
     logging.info(f"ابعاد داده‌های آموزشی (X): {X.shape}")
-    logging.info(f"ابعاد داده‌های فاندامنتال (X_fundamental): {X_fundamental.shape}")
 
     if X.empty:
         logging.error("داده‌های آموزشی (X) خالی هستند. بررسی کنید که چرا داده‌ها بعد از پیش‌پردازش حذف شدند.")
@@ -167,17 +145,10 @@ def main():
 
     label_mapping = {'Sell': 0, 'Hold': 1, 'Buy': 2}
     y = y.map(label_mapping)
-    y_fundamental = y_fundamental.map(label_mapping)
 
     logging.info("تقسیم داده‌ها به آموزشی و آزمایشی...")
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
     logging.info(f"تقسیم داده‌ها انجام شد: X_train={X_train.shape}, X_test={X_test.shape}")
-
-    if not X_fundamental.empty:
-        X_train_fund, X_test_fund, y_train_fund, y_test_fund = train_test_split(X_fundamental, y_fundamental, test_size=0.2, random_state=42)
-        logging.info(f"تقسیم داده‌های فاندامنتال انجام شد: X_train_fund={X_train_fund.shape}, X_test_fund={X_test_fund.shape}")
-    else:
-        logging.warning("داده کافی برای آموزش مدل فاندامنتال وجود ندارد.")
 
     if X_train.columns.duplicated().any():
         logging.warning(f"ستون‌های تکراری تو X_train: {X_train.columns[X_train.columns.duplicated()].tolist()}")
@@ -189,39 +160,45 @@ def main():
     X_train.fillna(X_train.mean(), inplace=True)
     X_test.replace([np.inf, -np.inf], np.nan, inplace=True)
     X_test.fillna(X_test.mean(), inplace=True)
-    if not X_fundamental.empty:
-        X_train_fund.replace([np.inf, -np.inf], np.nan, inplace=True)
-        X_train_fund.fillna(X_train_fund.mean(), inplace=True)
-        X_test_fund.replace([np.inf, -np.inf], np.nan, inplace=True)
-        X_test_fund.fillna(X_test.mean(), inplace=True)
     logging.info("مقادیر نامناسب اصلاح شدند.")
 
     X_train = ensure_dtypes(X_train)
     X_test = ensure_dtypes(X_test)
-    if not X_fundamental.empty:
-        X_train_fund = ensure_dtypes(X_train_fund)
-        X_test_fund = ensure_dtypes(X_test_fund)
 
     logging.info("اعمال SMOTE برای متعادل‌سازی کلاس‌ها...")
+    logging.info(f"توزیع کلاس‌ها قبل از SMOTE: {pd.Series(y_train).value_counts().to_dict()}")
     smote = SMOTE(random_state=42)
     X_train_resampled, y_train_resampled = smote.fit_resample(X_train, y_train)
+    logging.info(f"توزیع کلاس‌ها بعد از SMOTE: {pd.Series(y_train_resampled).value_counts().to_dict()}")
     logging.info(f"ابعاد داده‌های متعادل‌شده: X_train_resampled={X_train_resampled.shape}")
 
+    class_counts = y_train.value_counts()
+    total_samples = len(y_train)
+    class_weights = {i: total_samples / (len(class_counts) * count) for i, count in class_counts.items()}
+    logging.info(f"وزن‌های محاسبه‌شده برای کلاس‌ها: {class_weights}")
+
     logging.info("شروع بهینه‌سازی CatBoost...")
-    catboost = CatBoostClassifier(verbose=0, thread_count=12)
+    catboost = CatBoostClassifier(verbose=0, thread_count=-1)
     catboost_params = {
         'iterations': [300, 500],
         'learning_rate': [0.05, 0.1],
         'depth': [4, 6],
         'l2_leaf_reg': [3, 5]
     }
-    catboost_search = GridSearchCV(catboost, catboost_params, cv=3, scoring='f1_weighted', n_jobs=12)
+    catboost_search = GridSearchCV(catboost, catboost_params, cv=3, scoring='f1_weighted', n_jobs=-1)
     catboost_search.fit(X_train_resampled, y_train_resampled)
     logging.info("بهینه‌سازی CatBoost تموم شد.")
     logging.info(f"بهترین پارامترهای CatBoost: {catboost_search.best_params_}")
+    joblib.dump(catboost_search.best_estimator_, 'models/catboost_model.pkl')
+    logging.info("مدل CatBoost ذخیره شد: models/catboost_model.pkl")
+
+    y_pred_catboost = catboost_search.predict(X_test)
+    logging.info("گزارش عملکرد CatBoost:")
+    logging.info(classification_report(y_test, y_pred_catboost))
+    plot_confusion_matrix(y_test, y_pred_catboost, "CatBoost")
 
     logging.info("شروع بهینه‌سازی LightGBM...")
-    lgbm = LGBMClassifier(min_child_samples=10, min_split_gain=0.01, class_weight='balanced')
+    lgbm = LGBMClassifier(min_child_samples=10, min_split_gain=0.01)
     lgbm_params = {
         'n_estimators': [300, 500],
         'learning_rate': [0.05, 0.1],
@@ -229,65 +206,61 @@ def main():
         'reg_lambda': [0, 1],
         'feature_fraction': [0.8, 0.9]
     }
-    lgbm_search = GridSearchCV(lgbm, lgbm_params, cv=3, scoring='f1_weighted', n_jobs=12)
+    lgbm_search = GridSearchCV(lgbm, lgbm_params, cv=3, scoring='f1_weighted', n_jobs=-1)
     lgbm_search.fit(X_train_resampled, y_train_resampled)
     logging.info("بهینه‌سازی LightGBM تموم شد.")
     logging.info(f"بهترین پارامترهای LightGBM: {lgbm_search.best_params_}")
+    joblib.dump(lgbm_search.best_estimator_, 'models/lightgbm_model.pkl')
+    logging.info("مدل LightGBM ذخیره شد: models/lightgbm_model.pkl")
 
-    if not X_fundamental.empty:
-        logging.info("شروع بهینه‌سازی XGBoost (فاندامنتال)...")
-        xgboost = XGBClassifier(eval_metric='mlogloss')
-        xgboost_params = {
-            'n_estimators': [200, 300],
-            'learning_rate': [0.05, 0.1],
-            'max_depth': [3, 5],
-            'reg_lambda': [1, 3],
-            'reg_alpha': [0, 1]
-        }
-        xgboost_search = GridSearchCV(xgboost, xgboost_params, cv=3, scoring='f1_weighted', n_jobs=12)
-        xgboost_search.fit(X_train_fund, y_train_fund)
-        logging.info("بهینه‌سازی XGBoost تموم شد.")
-        logging.info(f"بهترین پارامترهای XGBoost (فاندامنتال): {xgboost_search.best_params_}")
-    else:
-        logging.warning("XGBoost به دلیل نبود داده‌های فاندامنتال اجرا نمی‌شود.")
+    y_pred_lgbm = lgbm_search.predict(X_test)
+    logging.info("گزارش عملکرد LightGBM:")
+    logging.info(classification_report(y_test, y_pred_lgbm))
+    plot_confusion_matrix(y_test, y_pred_lgbm, "LightGBM")
 
-    logging.info("محاسبه اهمیت فیچرها...")
-    best_catboost = catboost_search.best_estimator_
-    importances = best_catboost.get_feature_importance()
-    feature_names = X.columns
-    feature_importance_df = pd.DataFrame({'feature': feature_names, 'importance': importances})
-    feature_importance_df = feature_importance_df.sort_values(by='importance', ascending=False)
+    logging.info("شروع بهینه‌سازی XGBoost...")
+    xgboost = XGBClassifier(eval_metric='mlogloss')
+    xgboost_params = {
+        'n_estimators': [200, 300],
+        'learning_rate': [0.05, 0.1],
+        'max_depth': [3, 5],
+        'reg_lambda': [1, 3],
+        'reg_alpha': [0, 1]
+    }
+    xgboost_search = GridSearchCV(xgboost, xgboost_params, cv=3, scoring='f1_weighted', n_jobs=-1)
+    xgboost_search.fit(X_train_resampled, y_train_resampled)
+    logging.info("بهینه‌سازی XGBoost تموم شد.")
+    logging.info(f"بهترین پارامترهای XGBoost: {xgboost_search.best_params_}")
+    joblib.dump(xgboost_search.best_estimator_, 'models/xgboost_model.pkl')
+    logging.info("مدل XGBoost ذخیره شد: models/xgboost_model.pkl")
 
-    logging.info("ویژگی‌های مهم (CatBoost):")
-    logging.info(feature_importance_df.head(10))
+    y_pred_xgboost = xgboost_search.predict(X_test)
+    logging.info("گزارش عملکرد XGBoost:")
+    logging.info(classification_report(y_test, y_pred_xgboost))
+    plot_confusion_matrix(y_test, y_pred_xgboost, "XGBoost")
 
-    total_importance = feature_importance_df['importance'].sum()
-    threshold = 0.01 * total_importance
-    selected_features = feature_importance_df[feature_importance_df['importance'] > threshold]['feature']
-    logging.info(f"تعداد فیچرهای منتخب: {len(selected_features)}")
+    logging.info("اجرای RFE برای انتخاب ویژگی‌ها...")
+    estimator = CatBoostClassifier(**catboost_search.best_params_, verbose=0, thread_count=-1)
+    rfe = RFE(estimator, n_features_to_select=50)  # انتخاب 50 ویژگی
+    rfe.fit(X_train_resampled, y_train_resampled)
+    rfe_selected_features = X_train_resampled.columns[rfe.support_].tolist()
+    logging.info(f"ویژگی‌های انتخاب‌شده توسط RFE: {rfe_selected_features}")
 
-    X_train_selected = X_train_resampled[selected_features]
-    X_test_selected = X_test[selected_features]
+    X_train_selected = X_train_resampled[rfe_selected_features]
+    X_test_selected = X_test[rfe_selected_features]
     logging.info(f"ابعاد داده‌های منتخب: X_train_selected={X_train_selected.shape}, X_test_selected={X_test_selected.shape}")
 
     logging.info("تعریف مدل‌های بهینه‌شده...")
-    catboost_model = CatBoostClassifier(**catboost_search.best_params_, verbose=100, class_weights=[2, 1, 2], thread_count=12)
-    lgbm_model = LGBMClassifier(**lgbm_search.best_params_, min_child_samples=10, min_split_gain=0.01, class_weight='balanced')
-    if not X_fundamental.empty:
-        xgboost_model = XGBClassifier(**xgboost_search.best_params_, eval_metric='mlogloss')
+    catboost_model = CatBoostClassifier(**catboost_search.best_params_, verbose=100, class_weights=class_weights, thread_count=-1)
+    lgbm_model = LGBMClassifier(**lgbm_search.best_params_, min_child_samples=10, min_split_gain=0.01, class_weight=class_weights)
+    xgboost_model = XGBClassifier(**xgboost_search.best_params_, eval_metric='mlogloss', scale_pos_weight=class_weights)
 
     logging.info("آموزش مدل ترکیبی...")
-    if not X_fundamental.empty:
-        ensemble_model = VotingClassifier(estimators=[
-            ('catboost', catboost_model),
-            ('lightgbm', lgbm_model),
-            ('xgboost_fundamental', xgboost_model)
-        ], voting='soft', weights=[0.4, 0.4, 0.2])
-    else:
-        ensemble_model = VotingClassifier(estimators=[
-            ('catboost', catboost_model),
-            ('lightgbm', lgbm_model)
-        ], voting='soft', weights=[0.5, 0.5])
+    ensemble_model = VotingClassifier(estimators=[
+        ('catboost', catboost_model),
+        ('lightgbm', lgbm_model),
+        ('xgboost', xgboost_model)
+    ], voting='soft', weights=[0.4, 0.4, 0.2])
 
     ensemble_model.fit(X_train_selected, y_train_resampled)
     logging.info("مدل ترکیبی آموزش دید.")
@@ -295,10 +268,9 @@ def main():
     y_pred_ensemble = ensemble_model.predict(X_test_selected)
     logging.info("گزارش عملکرد مدل ترکیبی:")
     logging.info(classification_report(y_test, y_pred_ensemble))
+    plot_confusion_matrix(y_test, y_pred_ensemble, "Ensemble")
 
-    plot_confusion_matrix(y_test, y_pred_ensemble)
-
-    joblib.dump(ensemble_model, 'models/ensemble_model_multi_with_fundamental.pkl')
+    joblib.dump(ensemble_model, 'models/ensemble_model_multi_with_fundamental_Pro.pkl')
     logging.info("مدل ذخیره شد: ensemble_model_multi_with_fundamental.pkl")
 
 if __name__ == "__main__":

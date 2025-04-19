@@ -13,10 +13,12 @@ def clean_text(text):
     return text.strip()
 
 def analyze_sentiment(text):
+
     cleaned = clean_text(text)
     result = sentiment_pipeline(cleaned[:512])[0]
     label = result["label"]
     score = result["score"]
+    print(f"متن ورودی: {cleaned}, خروجی: {result}")
 
     if label == "POSITIVE":
         return round(score, 2)

@@ -19,20 +19,41 @@ from data.data_manager import has_trade_in_current_candle, insert_trade_with_can
 from data.data_manager import insert_balance_to_db
 from data.data_manager import update_position_trailing
 
-# لیست پیام‌های دریافت شده از WebSocket
-ws_messages = []
-
-async def websocket_handler(websocket, path):
+async def websocket_handler(websocket):
     try:
         async for message in websocket:
             print(f"📩 پیام WebSocket دریافت شد: {message}")
-            ws_messages.append(message)
+            # پردازش مستقیم پیام‌ها
+            if message.startswith("SELL:"):
+                symbol = message.split(":")[1]
+                print(f"🚨 دستور فروش فوری دریافت شد برای {symbol}")
+                position = get_position(symbol)
+                if position:
+                    entry_price = float(position["entry_price"])
+                    price = float(position["last_price"])
+                    profit = price - entry_price
+                    profit_percent = (profit / entry_price) * 100
+                    result = simulate_trade(symbol, "sell", price, confidence=0.0)
+                    delete_position(symbol)
+                    candle_time = int((int(time.time()) // (TIMEFRAME_MINUTES * 60)) * (TIMEFRAME_MINUTES * 60))
+                    insert_trade_with_candle(
+                        symbol, "sell", price, 0.0, candle_time, TRADE_MODE,
+                        profit_percent, exit_price=result.get("exit_price"), quantity=result.get("quantity")
+                    )
+                    insert_balance_to_db("WALLET", result["balance"])
+                    print(f"✅ فروش فوری انجام شد برای {symbol} | سود: {profit_percent:.2f}% | موجودی: {result['balance']}")
+                else:
+                    print(f"⚠️ پوزیشنی برای {symbol} وجود ندارد. فروش انجام نشد.")
     except Exception as e:
         print(f"❌ خطا در WebSocket: {e}")
 
 def is_port_in_use(port):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         return s.connect_ex(('localhost', port)) == 0
+
+if is_port_in_use(5678):
+    print("❌ خطا: پورت 5678 در حال استفاده است. برنامه متوقف می‌شود.")
+    exit(1)
 
 async def start_ws_server_async():
     async with websockets.serve(websocket_handler, "0.0.0.0", 5678):
@@ -41,7 +62,6 @@ async def start_ws_server_async():
 
 def start_ws_server():
     asyncio.run(start_ws_server_async())
-
 
 # شروع سرور WebSocket در ترد جداگانه
 if not is_port_in_use(5678):
@@ -53,49 +73,34 @@ else:
   
 
 def run_with_ml():
-    # ✅ بررسی وضعیت توقف/اجرا
+    print("SYMBOLS:", SYMBOLS)  # لاگ برای SYMBOLS
+    if not SYMBOLS:
+        print("❌ خطا: SYMBOLS خالی است!")
+        return
+
     if get_trade_status() == "paused":
         print("⏸ ربات در حالت توقف قرار دارد.")
         return 
 
     print("🚀 DiceDux ML در حال اجرا با مدل یادگیرنده...\n")
 
-    if ws_messages:
-        msg = ws_messages.pop(0)
-        if msg.startswith("SELL:"):
-            symbol = msg.split(":")[1]
-            print(f"🚨 دستور فروش فوری دریافت شد برای {symbol}")
-            position = get_position(symbol)
-            if position:
-                entry_price = float(position["entry_price"])
-                price = float(position["last_price"])
-                profit = price - entry_price
-                profit_percent = (profit / entry_price) * 100
-                result = simulate_trade(symbol, "sell", price, confidence=0.0)
-                delete_position(symbol)
-                candle_time = int((int(time.time()) // (TIMEFRAME_MINUTES * 60)) * (TIMEFRAME_MINUTES * 60))
-                insert_trade_with_candle(
-                    symbol, "sell", price, 0.0, candle_time, TRADE_MODE,
-                    profit_percent, exit_price=result.get("exit_price"), quantity=result.get("quantity")
-                )
-                insert_balance_to_db("WALLET", result["balance"])
-                print(f"✅ فروش فوری انجام شد برای {symbol} | سود: {profit_percent:.2f}% | موجودی: {result['balance']}")
-            else:
-                print(f"⚠️ پوزیشنی برای {symbol} وجود ندارد. فروش انجام نشد.")
-
     for symbol in SYMBOLS:
         print(f"🔎 تحلیل ML برای {symbol}")
         df = get_candle_data(symbol)
+        print(f"داده‌های کندل برای {symbol}: {df.shape}")  # لاگ برای داده‌ها
 
         if df.empty or len(df) < 50:
             print("⚠️ داده کافی برای تحلیل وجود ندارد.\n")
             continue
 
-        signal = predict_signal_from_model(df, symbol=symbol, interval=f"{TIMEFRAME_MINUTES}min", verbose=True)
-        signal["action"] = str(signal["action"]).lower().strip("[]' ")
-        price = df["close"].iloc[-1]
-
-        print(f"🤖 سیگنال مدل: {signal['action'].upper()} | قیمت: {price} | اعتماد: {signal['confidence']}")
+        try:
+            signal = predict_signal_from_model(df, symbol=symbol, interval=f"{TIMEFRAME_MINUTES}min", verbose=True)
+            signal["action"] = str(signal["action"]).lower().strip("[]' ")
+            price = df["close"].iloc[-1]
+            print(f"🤖 سیگنال مدل: {signal['action'].upper()} | قیمت: {price} | اعتماد: {signal['confidence']}")
+        except Exception as e:
+            print(f"❌ خطا در پیش‌بینی برای {symbol}: {e}")
+            continue
         
         # ✅ بررسی حداقل اعتماد
         if signal["confidence"] < 0.70:

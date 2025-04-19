@@ -16,22 +16,23 @@ def get_fundamental_score_from_db(symbol: str, timestamp: int, volume: float = 0
         conn = mysql.connector.connect(**MYSQL_CONFIG)
         cursor = conn.cursor()
 
-        time_window = 3600  # یک ساعت قبل و بعد
+        time_window = 6 * 3600  # ۶ ساعت قبل و بعد (طبق پیشنهاد قبلی)
         from_ts = timestamp - time_window
         to_ts = timestamp + time_window
 
         query = """
-            SELECT COALESCE(content, title) as text, source, published_at, sentiment_score
-            FROM news
-            WHERE symbol = %s AND published_at BETWEEN FROM_UNIXTIME(%s) AND FROM_UNIXTIME(%s)
-            ORDER BY published_at DESC
-            LIMIT 10
+        SELECT COALESCE(content, title) as text, source, published_at, sentiment_score
+        FROM news
+        WHERE symbol = %s AND published_at BETWEEN FROM_UNIXTIME(%s) AND FROM_UNIXTIME(%s)
+        ORDER BY published_at DESC
+        LIMIT 10
         """
         cursor.execute(query, (symbol, from_ts, to_ts))
         results = cursor.fetchall()
         texts = [(row[0][:512], row[1], row[2], row[3]) for row in results if row[0]]
 
         news_score = 0.0
+        print(f"اخبار خوانده‌شده از دیتابیس برای {symbol}: {texts}")
         if texts:
             scores = []
             for text, source, published_at, sentiment_score in texts:
@@ -46,7 +47,6 @@ def get_fundamental_score_from_db(symbol: str, timestamp: int, volume: float = 0
 
                     # وزن‌دهی بر اساس منبع و تازگی خبر
                     weight = 1.5 if source in ['coindesk', 'cointelegraph'] else 1.0
-                    # published_at حالا یه شیء datetime هست، مستقیم به تایم‌استمپ تبدیلش می‌کنیم
                     time_diff = (timestamp - int(published_at.timestamp())) / 3600
                     time_weight = max(1.0 - time_diff / 24, 0.5)  # اخبار جدیدتر وزن بیشتری دارن
                     scores.append(score * weight * time_weight)

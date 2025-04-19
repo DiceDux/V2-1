@@ -2,13 +2,28 @@ import pandas as pd
 import numpy as np
 import ta
 from data.data_manager import get_recent_news_texts
-from data.data_manager import get_index_value
-from ai.news_sentiment_ai import analyze_sentiment
 from data.market_index_manager import get_index
-from ai.fundamental_analyzer import analyze_fundamentals
+from transformers import AutoTokenizer, AutoModel
+import torch
+
+# لود کردن مدل و توکنایزر برای تولید embedding
+tokenizer = AutoTokenizer.from_pretrained("distilbert-base-uncased")
+model = AutoModel.from_pretrained("distilbert-base-uncased")
+
+def get_text_embedding(text):
+    if not text or not text.strip():
+        return np.zeros(768)
+    try:
+        inputs = tokenizer(text, return_tensors="pt", truncation=True, padding=True, max_length=512)
+        with torch.no_grad():
+            outputs = model(**inputs)
+        embedding = outputs.last_hidden_state[:, 0, :].squeeze().numpy()
+        return embedding
+    except Exception as e:
+        print(f"⚠️ خطا در تولید embedding برای متن: {text[:50]}...: {e}")
+        return np.zeros(768)
 
 def calculate_ichimoku_cloud(df):
-    """محاسبه اندیکاتور Ichimoku Cloud"""
     high = df['high']
     low = df['low']
     close = df['close']
@@ -28,13 +43,11 @@ def calculate_ichimoku_cloud(df):
     }
 
 def calculate_vwap(df):
-    """محاسبه VWAP"""
     typical_price = (df['high'] + df['low'] + df['close']) / 3
     vwap = (typical_price * df['volume']).cumsum() / df['volume'].cumsum()
     return vwap
 
 def calculate_obv(df):
-    """محاسبه OBV"""
     obv = [0]
     for i in range(1, len(df)):
         if df['close'].iloc[i] > df['close'].iloc[i-1]:
@@ -46,9 +59,6 @@ def calculate_obv(df):
     return pd.Series(obv, index=df.index)
 
 def calculate_chaikin_oscillator(df: pd.DataFrame) -> pd.Series:
-    """
-    محاسبه Chaikin Oscillator به صورت دستی
-    """
     money_flow_multiplier = ((df['close'] - df['low']) - (df['high'] - df['close'])) / (df['high'] - df['low'])
     money_flow_multiplier = money_flow_multiplier.fillna(0)
     money_flow_volume = money_flow_multiplier * df['volume']
@@ -59,8 +69,9 @@ def calculate_chaikin_oscillator(df: pd.DataFrame) -> pd.Series:
     return chaikin_osc
 
 def extract_features_full(df: pd.DataFrame, df_btc=None, df_eth=None, df_doge=None) -> pd.DataFrame:
+    print(f"ستون‌های ورودی df: {df.columns.tolist()}")
     df = df.copy()
-    features = {}   
+    features = {}
 
     # Basic Indicators
     features['ema20'] = df['close'].ewm(span=20).mean()
@@ -159,6 +170,9 @@ def extract_features_full(df: pd.DataFrame, df_btc=None, df_eth=None, df_doge=No
     features['session_asia'] = features['hour'].between(1, 9)
     features['session_europe'] = features['hour'].between(9, 17)
     features['session_us'] = features['hour'].between(17, 24)
+    features['day_of_week'] = pd.to_datetime(df['timestamp']).dt.dayofweek
+    features['month'] = pd.to_datetime(df['timestamp']).dt.month
+    features['price_to_30d_mean'] = df['close'] / df['close'].rolling(30).mean()
     features['double_top'] = (df['high'] > df['high'].shift(1)) & (df['high'].shift(1) > df['high'].shift(2))
     features['head_shoulders'] = (df['high'].shift(2) < df['high'].shift(1)) & (df['high'].shift(1) > df['high']) & (df['high'].shift(2) < df['high'])
     features['support_zone'] = df['low'].rolling(20).min()
@@ -194,9 +208,6 @@ def extract_features_full(df: pd.DataFrame, df_btc=None, df_eth=None, df_doge=No
     features["low_z_score"] = features["z_score"].abs() < 0.5
     features['chaikin_osc'] = calculate_chaikin_oscillator(df)
 
-    # اضافه کردن Chaikin Oscillator
-    features['chaikin_osc'] = calculate_chaikin_oscillator(df)
-
     # اندیکاتورهای جدید
     ichimoku = calculate_ichimoku_cloud(df)
     for key, value in ichimoku.items():
@@ -205,46 +216,42 @@ def extract_features_full(df: pd.DataFrame, df_btc=None, df_eth=None, df_doge=No
     features['vwap_new'] = calculate_vwap(df)
     features['obv_new'] = calculate_obv(df)
 
-    # تحلیل فاندامنتال
-    df_fund = analyze_fundamentals(df)
-    # فقط فیچرهایی که نیاز داریم رو اضافه می‌کنیم
-    if 'fundamental_score' not in features:
-        features['fundamental_score'] = df_fund.get('fundamental_score', pd.Series(0, index=df.index))
-    if 'news_score' not in features:
-        features['news_score'] = df_fund.get('news_score', pd.Series(0, index=df.index))
-    if 'volume_score' not in features:
-        features['volume_score'] = df_fund.get('volume_score', pd.Series(0, index=df.index))
+    # اضافه کردن volume_score به‌صورت دستی
+    features['volume_score'] = df['volume'].apply(lambda v: min(v / 1e7, 1.0) if v > 0 else 0.0)
 
-    # تحلیل اخبار
+    # اضافه کردن embedding اخبار
     if 'symbol' in df.columns and 'timestamp' in df.columns:
-        sentiments = []
+        news_embeddings = []
         for i, row in df.iterrows():
             try:
                 ts = int(pd.to_datetime(row['timestamp']).timestamp())
                 text = get_recent_news_texts(row['symbol'], ts)
-                score = analyze_sentiment(text)
-                sentiments.append(score)
+                embedding = get_text_embedding(text)
+                news_embeddings.append(embedding)
             except Exception as e:
-                print(f"⚠️ خطا در تحلیل خبر {row['symbol']} - {row['timestamp']}: {e}")
-                sentiments.append(0.0)
-        features['news_sentiment'] = pd.Series(sentiments, index=df.index)
+                print(f"⚠️ خطا در تولید embedding برای خبر {row['symbol']} - {row['timestamp']}: {e}")
+                news_embeddings.append(np.zeros(768))
 
+        embedding_df = pd.DataFrame(news_embeddings, columns=[f"news_emb_{i}" for i in range(768)], index=df.index)
+
+    # اضافه کردن شاخص‌های بازار
     if 'timestamp' in df.columns:
         features['btc_dominance'] = df['timestamp'].apply(lambda ts: get_index('BTC.D', ts))
         features['usdt_dominance'] = df['timestamp'].apply(lambda ts: get_index('USDT.D', ts))
-    
-    for key in features:
-        features[key] = features[key].reindex(df.index)
 
-    features_df = pd.concat(features, axis=1)
-    features_df = features_df.fillna(0)
+    features_df = pd.DataFrame(features, index=df.index)
     
-    # چک کردن فیچرهای تکراری
+    if 'symbol' in df.columns and 'timestamp' in df.columns:
+        features_df = pd.concat([features_df, embedding_df], axis=1)
+
+    features_df = features_df.fillna(0)
+
     if features_df.columns.duplicated().any():
         print(f"⚠️ ستون‌های تکراری یافت شدند: {features_df.columns[features_df.columns.duplicated()].tolist()}")
         features_df = features_df.loc[:, ~features_df.columns.duplicated()]
-    
+
     result_df = pd.concat([df, features_df], axis=1)
-    result_df = result_df.loc[:, ~result_df.columns.duplicated()]  # حذف ستون‌های تکراری
+    result_df = result_df.loc[:, ~result_df.columns.duplicated()]
     result_df = result_df.reset_index(drop=True)
+    
     return result_df
